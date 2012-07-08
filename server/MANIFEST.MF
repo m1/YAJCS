@@ -1,0 +1,2 @@
+Main-Class: server.Server
+Class-Path: mysql-connector-java-5.1.20-bin.jar

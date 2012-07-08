@@ -1,0 +1,694 @@
+package server;
+
+import java.io.*;
+import java.net.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.*;
+
+public class Server {
+	private ArrayList<S_client> users = new ArrayList<S_client>();
+	private int clientTimeToLive = 20; // seconds. If client doesn't respond
+										// after 20 seconds, kill.
+	private int port;
+	private ServerSocket serverSocket;
+	private Connection con = null;
+
+	public Server(int port) {
+		this.port = port;
+		// Start portlistener to listen for clients
+		portListener(port);
+	}
+
+	public void portListener(int port) {
+		System.out.println("[SERVER] Starting Server on port: " + port);
+		Statement st = null;
+		ResultSet rs = null;
+
+		String url = "jdbc:mysql://localhost:3306/chatserv";
+		String user = "chat";
+		String password = "test";
+		// Check if everything is okay!
+		try {
+			serverSocket = new ServerSocket(port);
+			System.out.println("[SERVER] Port connection [OK]");
+
+			System.out.println("[SERVER] Connecting to Database: " + url + " with user: " + user);
+			con = DriverManager.getConnection(url, user, password);
+			st = con.createStatement();
+			// Get Version of database
+			rs = st.executeQuery("SELECT VERSION()");
+
+			if (rs.next()) {
+				System.out.println("[SERVER] Database version: " + rs.getString(1));
+				System.out.println("[SERVER] Database connection [OK]");
+			}
+			System.out.println("[SERVER] Started Server [OK]");
+			Socket client;
+			while (true) {
+				// Wait for clients
+				client = serverSocket.accept();
+
+				// Accepted client
+				System.out.println("[SERVER] Connection accepted from: " + client.toString());
+
+				// Now start worker!
+				new S_worker(client);
+			}
+		} catch (Exception e) {
+			System.out.println("Started Server [FAIL] \nError: " + e.getStackTrace());
+		}
+	}
+
+	public void broadCast(String usr, String str) {
+		// System wide broadcast (for Server announcements)
+		for (S_client user : users) {
+			user.message(usr, str);
+		}
+	}
+
+	public int getSocket() {
+		return port;
+	}
+
+	public static void main(String[] args) {
+		// Create new server on port 5000
+		new Server(5000);
+	}
+
+	class S_worker extends Thread {
+		// This creates new clients without having to wait for the main thread
+		// to accept and create a client
+		Socket client;
+
+		public S_worker(Socket client) {
+			this.client = client;
+			start();
+		}
+
+		@Override
+		public void run() {
+			// Make a new client thread
+			S_client newUser = new S_client(client);
+
+			// Add the client to the client arraylist
+			users.add(newUser);
+
+			// Announce that the last user has arrived to the whole server
+			String str = users.get(users.size() - 1).getUserName() + " connected.";
+			broadCast("server", str);
+		}
+	}
+
+	class HeartBeat extends Thread {
+		// This sends out a signal to the client, if no response in time:
+		// clientTimeToLive(default 20s) then kill
+		boolean sent = true;
+		boolean recieved = true;
+		boolean dead = false;
+		S_client cc;
+
+		public HeartBeat(S_client cc) {
+			this.cc = cc;
+			start();
+		}
+
+		public void run() {
+			try {
+				// If a packet was sent and no reply was received = kill
+				while (true && !dead) {
+					if (sent && !recieved) {
+						System.out.println("[HEARTBEAT] " + cc.getUserName() + " timed out.");
+						dead = true;
+
+						// finish this loop
+						break;
+					}
+					send();
+					sent = true;
+					recieved = false;
+
+					// wait 20 seconds until sending heartbeat
+					Thread.sleep(clientTimeToLive * 1000);
+
+				}
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+		}
+
+		public void send() {
+			System.out.println("[HEARTBEAT] Sending to: " + cc.getUserName());
+
+			// Send a message to the client
+			cc.message("heartbeat", "Checking if alive: " + cc.getUserName());
+		}
+
+		public void recieved() {
+			// A message was received back, safe for now...
+			System.out.println("[HEARTBEAT] Recieved from: " + cc.getUserName());
+			recieved = true;
+		}
+
+		public boolean isDead() {
+			return dead;
+		}
+
+		public void kill() {
+			dead = true;
+		}
+	}
+
+	class S_client extends Thread {
+		Socket client;
+		String username = null;
+		String[] blockedUsers = null;
+		ArrayList<String> blocked = new ArrayList<String>();
+		ArrayList<String> broadcast = new ArrayList<String>();
+		String[] broadCastUsers = null;
+		private BufferedReader in;
+		private PrintWriter out;
+		private ResultSet rs = null;
+		private PreparedStatement ps = null;
+		private String tempBlocked;
+		private String tempBroadCast;
+		HeartBeat heartBeat;
+		String password = null;
+		long timeCreated;
+
+		public S_client(Socket client) {
+			// Get current time so we can see the uptime
+			timeCreated = System.currentTimeMillis();
+			this.client = client;
+			String choice;
+
+			try {
+				in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+				out = new PrintWriter(client.getOutputStream());
+				out.println("[SERVER] Server responded");
+				out.flush();
+
+				// Try and get username?
+				System.out.println("[SERVER] Asking for username from User: " + client.toString());
+
+				// Register or login?
+				message("server", "Enter L to login or R to register as a new user");
+				choice = in.readLine();
+				while (!choice.equalsIgnoreCase("l") && !choice.equalsIgnoreCase("r")) {
+					message("server", "Enter L to login or R to register as a new user");
+					choice = in.readLine();
+				}
+				// enter username
+				message("server", "Enter Username:");
+				username = in.readLine();
+
+				// login
+				if (choice.equalsIgnoreCase("l")) {
+					login();
+				}
+				// register
+				else if (choice.equalsIgnoreCase("r")) {
+					reg();
+				} else {
+					System.out.println("Something went wrong");
+				}
+
+				// The user registerd or logged in
+				System.out.println("[SERVER] User Thread: " + Thread.currentThread().getId() + " assumed username: " + username);
+
+				// update blocklist/broadcast info
+				updateCINFO();
+
+				// display it to the user
+				message("server", "Welcome " + username + "!");
+				message("server", "Blocked: " + tempBlocked);
+				message("server", "Broadcast: " + tempBroadCast);
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+			// start a heartbeat on this client
+			heartBeat = new HeartBeat(this);
+			start();
+		}
+
+		public void updateCINFO() {
+			try {
+				// get broadcast/blocked lists
+				ps = con.prepareStatement("SELECT * FROM user WHERE username='" + username + "'");
+				rs = ps.executeQuery();
+				rs.next();
+				tempBlocked = rs.getString("blocked");
+				blockedUsers = tempBlocked.split(" ");
+				tempBroadCast = rs.getString("broadcast");
+				broadCastUsers = tempBroadCast.split(" ");
+				for (String usr : broadCastUsers) {
+					usr = usr.trim();
+					broadcast.add(usr);
+				}
+				for (String usr : blockedUsers) {
+					usr = usr.trim();
+					blocked.add(usr);
+				}
+			} catch (Exception e) {
+
+			}
+
+		}
+
+		public void login() {
+			boolean reg = false;
+			String yon;
+			try {
+				message("server", "Enter Password:");
+				password = in.readLine();
+
+				// does user exist?
+				ps = con.prepareStatement("SELECT * FROM user WHERE username='" + username + "'");
+				rs = ps.executeQuery();
+
+				if (!rs.next()) {
+
+					// nope
+					while (!rs.next() && !reg) {
+						message("server", username + " doesn't exsist, would you like to register this user? Y/N");
+						yon = in.readLine();
+						// if user doesn't enter y or n
+						while (!yon.equalsIgnoreCase("y") && !yon.equalsIgnoreCase("n")) {
+							message("server", "Enter Y or N");
+							yon = in.readLine();
+						}
+						// register a new nickname!
+						if (yon.equalsIgnoreCase("y")) {
+							reg = true;
+						} else if (yon.equalsIgnoreCase("n")) {
+
+							// login with real username!
+							message("server", username + " doesn't exist, enter username: ");
+							username = in.readLine();
+							ps = con.prepareStatement("SELECT * FROM user WHERE username='" + username + "'");
+							rs = ps.executeQuery();
+							message("server", "Enter Password:");
+							password = in.readLine();
+						}
+					}
+
+				}
+				// yes! If user didn't choose to register a new login
+				if (!reg) {
+					// does info match up to database
+					ps = con.prepareStatement("SELECT * FROM user WHERE username='" + username + "' AND password=SHA1('" + password + "');");
+					rs = ps.executeQuery();
+
+					while (!rs.next()) {
+						// nope
+						message("server", " Incorrect password for user: " + username + " type password again: ");
+						password = in.readLine();
+						ps = con.prepareStatement("SELECT * FROM user WHERE username='" + username + "' AND password=SHA1('" + password + "');");
+						rs = ps.executeQuery();
+					}
+
+					if (rs.next()) {
+						// yes
+						System.out.println("[SERVER] Client Thread: " + Thread.currentThread().getId() + " successfully logged into user: " + rs.getString(2));
+
+					}
+					// if the user decided to register a new handle
+				} else {
+					reg();
+				}
+			} catch (Exception e) {
+
+			}
+		}
+
+		public void reg() {
+			try {
+				message("server", "Enter Password:");
+				password = in.readLine();
+
+				// Queries the database to see if someone already has that name
+				ps = con.prepareStatement("SELECT * FROM user WHERE username='" + username + "';");
+				rs = ps.executeQuery();
+				// does a user already have that name?
+				while (rs.next()) {
+					// yes
+					message("server", "Username: " + username + " already taken.");
+					message("server", "Enter username:");
+					username = in.readLine();
+					message("server", "Enter password:");
+					password = in.readLine();
+					ps = con.prepareStatement("SELECT * FROM user WHERE username='" + username + "';");
+					rs = ps.executeQuery();
+				}
+				if (!rs.next()) {
+					// nope, so insert into db!
+					String query;
+					Statement st;
+					st = con.createStatement();
+					query = "INSERT INTO user VALUES(NULL,'" + username + "',SHA1('" + password + "'),'','');";
+					st.executeUpdate(query);
+					System.out.println("[SERVER] New user registered: " + username);
+					message("server", username + " successfully registered!");
+				}
+			} catch (Exception e) {
+
+			}
+		}
+
+		public String getUserName() {
+			return username;
+		}
+
+		public void run() {
+			String str, message, usr;
+			boolean found = false;
+			try {
+				// wait for inputs whilst the thread is aliving and accepting
+				// them.
+				while (((str = in.readLine()) != null) && !heartBeat.isDead()) {
+					if (!str.isEmpty() && str != null) {
+						// private message!
+						if (str.startsWith("@")) {
+							usr = str.substring(1, str.indexOf(":"));
+							for (S_client user : users) {
+								if (usr.equalsIgnoreCase(user.getUserName())) {
+									found = true;
+									message = str.substring(str.indexOf(":"), str.length());
+									// send private message with "priv" for
+									// server handling
+									user.message("priv " + this.getUserName(), "[FROM " + this.getUserName() + "]" + message);
+									break;
+								} else {
+									found = false;
+								}
+							}
+							if (!found) {
+								message("server", "User not found!");
+							}
+							// This is for the heartbeat logistics, the user
+							// won't see this.
+						} else if (str.startsWith("[RESPONSE]")) {
+							heartBeat.recieved();
+							// user commands
+						} else if (str.startsWith("!")) {
+
+							str = str.trim();
+							if (str.equalsIgnoreCase("!block")) {
+								msgCmd("block");
+							} else if (str.equalsIgnoreCase("!unblock")) {
+								msgCmd("unblock");
+							} else if (str.equalsIgnoreCase("!status")) {
+								msgCmd("status");
+							} else if (str.equalsIgnoreCase("!quit")) {
+								msgCmd("quit");
+							} else if (str.equalsIgnoreCase("!setsend")) {
+								msgCmd("setsend");
+							} else {
+								String command;
+								try {
+									// ex. gets -> ![setsend] : ignores !
+									command = str.substring(1, str.indexOf(" "));
+
+									if (command.equalsIgnoreCase("setsend")) {
+										msgCmdParas("setsend", str);
+									} else if (command.equalsIgnoreCase("addsend")) {
+										msgCmdParas("addsend", str);
+
+									} else if (command.equalsIgnoreCase("delsend")) {
+										msgCmdParas("delsend", str);
+
+									} else if (command.equalsIgnoreCase("unblock")) {
+										msgCmdParas("unblock", str);
+
+									} else if (command.equalsIgnoreCase("block")) {
+										msgCmdParas("block", str);
+									} else {
+										message("server", "Command not understood!");
+									}
+
+								} catch (Exception e) {
+									message("server", "Command not understood!");
+								}
+							}
+						} else {
+							// If wasn't a command or private message then do a
+							// client broadcast!
+							cBroadCast(str);
+
+						}
+					}
+				}
+				// If the client disconnected or timed out, then tell the other
+				// clients and remove from the user arraylist.
+				System.out.println("[SERVER] User: " + username + " died.");
+				broadCast("server", username + " disconnected");
+				users.remove(this);
+			} catch (Exception e) {
+
+			}
+		}
+
+		public void msgCmd(String cmd) {
+			// Message commands without parameters.
+			String sql;
+			String tempString = "";
+			PreparedStatement pst = null;
+			try {
+				if (cmd.equalsIgnoreCase("block")) {
+					// block all
+					sql = "SELECT username FROM user";
+					pst = con.prepareStatement(sql);
+					rs = pst.executeQuery();
+					while (rs.next()) {
+						tempString += rs.getString("username") + " ";
+					}
+					sql = "UPDATE user SET blocked='" + tempString + "' WHERE username='" + username + "'";
+					pst = con.prepareStatement(sql);
+					pst.executeUpdate();
+					message("server", "All Users added to your blocked list!");
+				} else if (cmd.equalsIgnoreCase("unblock")) {
+					// unblock all
+					sql = "UPDATE user SET blocked='" + "" + "' WHERE username='" + username + "'";
+					pst = con.prepareStatement(sql);
+					pst.executeUpdate();
+					message("server", "Blocklist cleared");
+				} else if (cmd.equalsIgnoreCase("setsend")) {
+					sql = "UPDATE user SET broadcast='" + "" + "' WHERE username='" + username + "'";
+					pst = con.prepareStatement(sql);
+					pst.executeUpdate();
+					message("server", "Broadcast cleared");
+				} else if (cmd.equalsIgnoreCase("status")) {
+					// get currenttime and take away from when we started the
+					// time at the start of creating the client thread
+					long uptime = System.currentTimeMillis() - timeCreated;
+					sql = "SELECT blocked, broadcast FROM user WHERE username='" + username + "';";
+					pst = con.prepareStatement(sql);
+					rs = pst.executeQuery();
+					rs.next();
+					message("server", "Uptime: " + uptime / 1000 + " seconds. Blocked users: "
+							+ ((rs.getString("blocked").isEmpty()) ? "empty" : rs.getString("blocked")) + ". BroadCast users: " + rs.getString("broadcast"));
+				} else if (cmd.equalsIgnoreCase("quit")) {
+					// if !quit then kill the heartbeat
+					heartBeat.kill();
+				}
+				// update all the broadcast/blocking info
+				updateCINFO();
+
+			} catch (Exception e) {
+
+			}
+		}
+
+		public void msgCmdParas(String cmd, String parameters) {
+			// commands with parameters
+			String tempUsr;
+			PreparedStatement pst = null;
+			ResultSet rs = null;
+			String sql = null;
+			boolean found = false;
+			String[] tempArr;
+			ArrayList<String> tempList = new ArrayList<String>();
+			tempUsr = parameters.substring(cmd.length() + 1, parameters.length());
+			tempUsr = tempUsr.trim();
+			String tempString = "";
+			if (cmd.equalsIgnoreCase("setsend")) {
+				// adds all the !setsend [user1 user2 user3] -> broadcast list
+				try {
+					sql = "UPDATE user SET broadcast='" + tempUsr + "' WHERE username='" + username + "'";
+					pst = con.prepareStatement(sql);
+					pst.executeUpdate();
+					message("server", tempUsr + " added to broadcast list");
+				} catch (Exception e) {
+
+				}
+
+			} else {
+				if (tempUsr.contains(" ")) {
+					// supplied too many parameters? ex. !block [user1 user2] ->
+					// it only takes 1 parameter ex. !block [user1]
+					message("server", "Command only takes one parameter.");
+				}
+				try {
+					if (cmd.equalsIgnoreCase("block") || cmd.equalsIgnoreCase("unblock")) {
+						sql = "SELECT blocked FROM user WHERE username='" + username + "';";
+						pst = con.prepareStatement(sql);
+						rs = pst.executeQuery();
+						rs.next();
+						tempArr = rs.getString("blocked").trim().split(" ");
+						if (cmd.equalsIgnoreCase("block")) {
+							for (String usr : tempArr) {
+								if (usr.equalsIgnoreCase(tempUsr)) {
+									message("server", tempUsr + " already in blocked list");
+									found = true;
+								}
+							}
+							if (!found) {
+								for (String usr : tempArr) {
+									tempList.add(usr);
+								}
+								tempList.add(tempUsr);
+								for (String usr : tempList) {
+									tempString += usr + " ";
+								}
+								System.out.println(tempString);
+								sql = "UPDATE user SET blocked='" + tempString + "' WHERE username='" + username + "'";
+								pst = con.prepareStatement(sql);
+								pst.executeUpdate();
+								message("server", tempUsr + " added to your blocked list!");
+							}
+						} else if (cmd.equalsIgnoreCase("unblock")) {
+
+							found = true;
+							for (String usr : tempArr) {
+								tempList.add(usr);
+							}
+							if (!tempList.contains(tempUsr)) {
+								message("server", tempUsr + " isn't in the blocked list!");
+							} else {
+								tempList.remove(tempUsr);
+								for (String usr : tempList) {
+									tempString += usr + " ";
+								}
+								sql = "UPDATE user SET blocked='" + tempString + "' WHERE username='" + username + "'";
+								pst = con.prepareStatement(sql);
+								pst.executeUpdate();
+								message("server", tempUsr + " removed from your blocked list!");
+							}
+
+						}
+					} else if (cmd.equalsIgnoreCase("addsend") || cmd.equalsIgnoreCase("delsend")) {
+						if (cmd.equalsIgnoreCase("addsend")) {
+							sql = "SELECT broadcast FROM user WHERE username='" + username + "';";
+							pst = con.prepareStatement(sql);
+							rs = pst.executeQuery();
+							rs.next();
+							tempArr = rs.getString("broadcast").trim().split(" ");
+
+							for (String usr : tempArr) {
+								if (usr.equalsIgnoreCase(tempUsr)) {
+									message("server", tempUsr + " already in broadcast list");
+									found = true;
+								}
+							}
+							if (!found) {
+								for (String usr : tempArr) {
+									tempList.add(usr);
+								}
+								tempList.add(tempUsr);
+								for (String usr : tempList) {
+									tempString += usr + " ";
+								}
+								System.out.println(tempString);
+								sql = "UPDATE user SET broadcast='" + tempString + "' WHERE username='" + username + "'";
+								pst = con.prepareStatement(sql);
+								pst.executeUpdate();
+								message("server", tempUsr + " added to your broadcast list!");
+							}
+						} else if (cmd.equalsIgnoreCase("delsend")) {
+							sql = "SELECT broadcast FROM user WHERE username='" + username + "';";
+							pst = con.prepareStatement(sql);
+							rs = pst.executeQuery();
+							rs.next();
+							tempArr = rs.getString("broadcast").trim().split(" ");
+							found = true;
+							for (String usr : tempArr) {
+								tempList.add(usr);
+							}
+							if (!tempList.contains(tempUsr)) {
+								message("server", tempUsr + " isn't in the broadcast list!");
+							} else {
+								tempList.remove(tempUsr);
+								for (String usr : tempList) {
+									tempString += usr + " ";
+								}
+								sql = "UPDATE user SET broadcast='" + tempString + "' WHERE username='" + username + "'";
+								pst = con.prepareStatement(sql);
+								pst.executeUpdate();
+								message("server", tempUsr + " removed from your broadcast list!");
+							}
+						}
+					}
+				} catch (Exception e) {
+
+				}
+			}
+			// update info again!
+			updateCINFO();
+		}
+
+		public void message(String usr, String msg) {
+			// usr = who its from or in private message case, handle it
+			// differently.
+			// msg = the content!
+			String str = null;
+			boolean priv = false;
+			// is it a private message?
+			if (usr.startsWith("priv")) {
+				usr = usr.substring(3, usr.length());
+				priv = true;
+				str = msg;
+			}
+			if (usr.equalsIgnoreCase("server")) {
+				str = "[SERVER] " + msg;
+			} else if (usr.equalsIgnoreCase("heartbeat")) {
+				str = "[HEARTBEAT]" + msg;
+			} else if (blocked.contains(usr)) {
+				// did a blocked user try and contact you? Tell the server, but
+				// don't trouble yourself
+				System.out.println("[SERVER] " + usr + "tried to contact " + username + " but is blocked.");
+			}
+
+			else if (!priv) {
+				// if not private then broadcast!
+				str = "<" + usr + "> " + msg;
+			}
+			out.println(str);
+			out.flush();
+		}
+
+		public void cBroadCast(String msg) {
+			// client broadcast
+			System.out.println("[CHAT] " + msg);
+
+			if (broadcast.isEmpty()) {
+				// if broadcast is empty then tell everyone!
+				broadCast(username, msg);
+			} else {
+				// else iterate through the broadcast list and user list to tell
+				// the people in your broadcast and who are online
+				for (String usr : broadcast) {
+					for (S_client user : users) {
+						if (usr.equalsIgnoreCase(user.getUserName())) {
+							user.message(username, msg);
+						}
+					}
+				}
+				// message myself!
+				message(username, msg);
+			}
+		}
+	}
+}
